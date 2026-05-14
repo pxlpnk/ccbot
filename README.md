@@ -155,15 +155,16 @@ ccbot supports the OpenAI Codex CLI alongside Claude Code via a parallel runtime
 3. Install the hook: `ccbot hook --install` (writes both Claude and Codex hooks; safe to re-run).
 4. Optional: set `CODEX_COMMAND=codex --yolo` if you want the unsafe-but-no-approval-prompt mode (analogous to `claude --dangerously-skip-permissions`).
 
-When you create a new Telegram topic, the bot will launch `codex` (or `codex resume <thread_id>` when you pick an existing thread) in a tmux window. The same workflow as Claude — directory browser, optional thread picker, then forwarded messages — applies.
+When you create a new Telegram topic, the bot shows an inline keyboard asking *Which agent? [Claude] [Codex]*. After you pick, the directory browser appears; the rest of the flow — directory pick, optional thread picker, then forwarded messages — is the same for both runtimes. The configured `CCBOT_DEFAULT_AGENT` is shown first in the picker with a `•` marker.
 
-**Known gaps in this release** (see `doc/ontology.md` and follow-up PRs):
+Notifications for Codex sessions flow through the same pipeline as Claude: assistant text, reasoning, tool calls + results all reach Telegram. Codex's auto-injected `<INSTRUCTIONS>` / `<environment_context>` / `AGENTS.md` blocks are filtered out so internal context never leaks into the chat.
 
-- Per-topic agent picker UI (`Which agent? [Claude] [Codex]` inline keyboard) is not yet wired — the default-agent env var is the only switch. Mixed Claude + Codex deployments within one bot instance require choosing the default per-process.
-- Full notification routing through `NormalizedEvent` for Codex (reasoning summaries, function-call output rendering) is implemented in the agent layer but not yet consumed by `SessionMonitor`. Codex spawn + keystroke forwarding + thread resume + history listing all work; live-stream notifications are coming.
-- Approval-action UI (PreToolUse / PermissionRequest) for Codex is read-only in this release. Run Codex with `--yolo` or `--full-auto` for unattended use.
+**Known gaps** (see `doc/ontology.md`):
 
-For background on the design — including the entity ontology and why launcher-side registration replaces hook-as-primary in subsequent work — see `doc/ontology.md` and `doc/codex-rollout.md`.
+- Approval-action UI (PreToolUse / PermissionRequest) for Codex is read-only. The terminal-parser detects approval prompts but doesn't yet expose action buttons — run Codex with `--yolo` or `--full-auto` for unattended use, or look at the tmux pane directly to respond.
+- Launcher-side registration as primary truth for binding is a `WindowState.runtime_kind` stamp today; a separate `launcher_registry.json` (covering rare same-cwd race conditions) is deferred until real same-cwd races surface in production.
+
+For background on the design — entity ontology, runtime asymmetries, and the JSONL line-type contract — see `doc/ontology.md` and `doc/codex-rollout.md`.
 
 ## Usage
 

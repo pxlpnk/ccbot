@@ -68,6 +68,9 @@ from .handlers.callback_data import (
     CB_ASK_SPACE,
     CB_ASK_TAB,
     CB_ASK_UP,
+    CB_AGENT_CANCEL,
+    CB_AGENT_CLAUDE,
+    CB_AGENT_CODEX,
     CB_DIR_CANCEL,
     CB_DIR_CONFIRM,
     CB_DIR_PAGE,
@@ -88,15 +91,19 @@ from .handlers.directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
     BROWSE_PATH_KEY,
+    PENDING_AGENT_KEY,
     SESSIONS_KEY,
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
+    STATE_PICKING_AGENT,
     STATE_SELECTING_SESSION,
     STATE_SELECTING_WINDOW,
     UNBOUND_WINDOWS_KEY,
+    build_agent_picker,
     build_directory_browser,
     build_session_picker,
     build_window_picker,
+    clear_agent_picker_state,
     clear_browse_state,
     clear_session_picker_state,
     clear_window_picker_state,
@@ -911,19 +918,17 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await safe_reply(update.message, msg_text, reply_markup=keyboard)
             return
 
-        # No unbound windows — show directory browser to create a new session
+        # No unbound windows — show agent picker first (Claude vs Codex),
+        # then transition to directory browser. The picker stores the choice
+        # in PENDING_AGENT_KEY for the subsequent _create_and_bind_window.
         logger.info(
-            "Unbound topic: showing directory browser (user=%d, thread=%d)",
+            "Unbound topic: showing agent picker (user=%d, thread=%d)",
             user.id,
             thread_id,
         )
-        start_path = str(Path.cwd())
-        msg_text, keyboard, subdirs = build_directory_browser(start_path)
+        msg_text, keyboard = build_agent_picker()
         if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            context.user_data[BROWSE_PATH_KEY] = start_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
+            context.user_data[STATE_KEY] = STATE_PICKING_AGENT
             context.user_data["_pending_thread_id"] = thread_id
             context.user_data["_pending_thread_text"] = text
         await safe_reply(update.message, msg_text, reply_markup=keyboard)
@@ -1001,14 +1006,22 @@ async def _create_and_bind_window(
     """Create a tmux window, bind it to a topic, and forward pending text.
 
     Shared by CB_DIR_CONFIRM (no sessions), CB_SESSION_NEW, and CB_SESSION_SELECT.
+    Reads the chosen runtime adapter from ``user_data[PENDING_AGENT_KEY]``
+    (populated by the agent picker) so spawn args, resume invocation, and
+    persisted ``WindowState.runtime_kind`` all agree.
     """
     from telegram import CallbackQuery, User
 
     assert isinstance(query, CallbackQuery)
     assert isinstance(user, User)
 
+    agent_kind = (context.user_data or {}).get(
+        PENDING_AGENT_KEY
+    ) or config.default_agent_kind
+    chosen_agent = config.agents.get(agent_kind) or config.default_agent
+
     success, message, created_wname, created_wid = await tmux_manager.create_window(
-        selected_path, resume_session_id=resume_session_id
+        selected_path, resume_session_id=resume_session_id, agent=chosen_agent
     )
     if success:
         logger.info(
@@ -1027,6 +1040,18 @@ async def _create_and_bind_window(
         hook_ok = await session_manager.wait_for_session_map_entry(
             created_wid, timeout=hook_timeout
         )
+
+        # Persist the runtime adapter on the window state so the monitor and
+        # session reads route through the correct on-disk layout after
+        # restart. Default is "claude" (set in WindowState dataclass).
+        if agent_kind != "claude":
+            ws = session_manager.get_window_state(created_wid)
+            if ws.runtime_kind != agent_kind:
+                ws.runtime_kind = agent_kind
+                session_manager._save_state()
+                logger.info(
+                    "Window %s: persisted runtime_kind=%s", created_wid, agent_kind
+                )
 
         # --resume creates a new session_id in the hook, but messages continue
         # writing to the resumed session's JSONL file. Override window_state to
@@ -1084,6 +1109,7 @@ async def _create_and_bind_window(
                 if context.user_data is not None:
                     context.user_data.pop("_pending_thread_text", None)
                     context.user_data.pop("_pending_thread_id", None)
+                    context.user_data.pop(PENDING_AGENT_KEY, None)
                 send_ok, send_msg = await session_manager.send_to_window(
                     created_wid,
                     pending_text,
@@ -1098,6 +1124,7 @@ async def _create_and_bind_window(
                     )
             elif context.user_data is not None:
                 context.user_data.pop("_pending_thread_id", None)
+                context.user_data.pop(PENDING_AGENT_KEY, None)
         else:
             # Should not happen in topic-only mode, but handle gracefully
             await safe_edit(query, f"✅ {message}")
@@ -1495,6 +1522,52 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data[BROWSE_DIRS_KEY] = subdirs
         await safe_edit(query, msg_text, reply_markup=keyboard)
         await query.answer()
+
+    # Agent picker: user chose Claude or Codex — store and transition to
+    # the directory browser. We don't re-check unbound windows here because
+    # the picker is only shown when there were no unbound windows in the
+    # first place.
+    elif data in (CB_AGENT_CLAUDE, CB_AGENT_CODEX):
+        pending_tid = (
+            context.user_data.get("_pending_thread_id") if context.user_data else None
+        )
+        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+        chosen = "claude" if data == CB_AGENT_CLAUDE else "codex"
+        logger.info(
+            "Agent picker: user=%d thread=%s chose %s",
+            user.id,
+            pending_tid,
+            chosen,
+        )
+        clear_agent_picker_state(context.user_data)
+        if context.user_data is not None:
+            context.user_data[PENDING_AGENT_KEY] = chosen
+            start_path = str(Path.cwd())
+            msg_text, keyboard, subdirs = build_directory_browser(start_path)
+            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
+            context.user_data[BROWSE_PATH_KEY] = start_path
+            context.user_data[BROWSE_PAGE_KEY] = 0
+            context.user_data[BROWSE_DIRS_KEY] = subdirs
+            await safe_edit(query, msg_text, reply_markup=keyboard)
+        await query.answer(f"Selected {chosen.title()}")
+
+    # Agent picker: cancel
+    elif data == CB_AGENT_CANCEL:
+        pending_tid = (
+            context.user_data.get("_pending_thread_id") if context.user_data else None
+        )
+        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+        clear_agent_picker_state(context.user_data)
+        if context.user_data is not None:
+            context.user_data.pop("_pending_thread_id", None)
+            context.user_data.pop("_pending_thread_text", None)
+            context.user_data.pop(PENDING_AGENT_KEY, None)
+        await safe_edit(query, "Cancelled")
+        await query.answer("Cancelled")
 
     # Window picker: cancel
     elif data == CB_WIN_CANCEL:

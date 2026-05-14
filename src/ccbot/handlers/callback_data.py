@@ -47,5 +47,10 @@ CB_SESSION_SELECT = "rs:sel:"  # rs:sel:<index>
 CB_SESSION_NEW = "rs:new"  # start a new session
 CB_SESSION_CANCEL = "rs:cancel"  # cancel
 
+# Agent picker (runtime selection before new-session creation)
+CB_AGENT_CLAUDE = "ag:claude"
+CB_AGENT_CODEX = "ag:codex"
+CB_AGENT_CANCEL = "ag:cancel"
+
 # Screenshot control keys
 CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>

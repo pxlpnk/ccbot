@@ -23,6 +23,9 @@ from ..session import ClaudeSession
 
 from ..config import config
 from .callback_data import (
+    CB_AGENT_CANCEL,
+    CB_AGENT_CLAUDE,
+    CB_AGENT_CODEX,
     CB_DIR_CANCEL,
     CB_DIR_CONFIRM,
     CB_DIR_PAGE,
@@ -49,6 +52,48 @@ BROWSE_DIRS_KEY = "browse_dirs"  # Cache of subdirs for current path
 UNBOUND_WINDOWS_KEY = "unbound_windows"  # Cache of (name, cwd) tuples
 STATE_SELECTING_SESSION = "selecting_session"
 SESSIONS_KEY = "cached_sessions"  # Cache of ClaudeSession list
+STATE_PICKING_AGENT = "picking_agent"
+PENDING_AGENT_KEY = "_pending_agent"  # "claude" | "codex", set after pick
+
+
+def build_agent_picker() -> tuple[str, InlineKeyboardMarkup]:
+    """Inline keyboard for choosing the runtime adapter before window creation.
+
+    The default highlighted via env (``CCBOT_DEFAULT_AGENT``) determines the
+    button order — the default is shown first.
+    """
+    default_first = config.default_agent_kind == "claude"
+    claude_label = "Claude" + (" •" if default_first else "")
+    codex_label = "Codex" + (" •" if not default_first else "")
+    buttons: list[list[InlineKeyboardButton]] = []
+    if default_first:
+        buttons.append(
+            [
+                InlineKeyboardButton(claude_label, callback_data=CB_AGENT_CLAUDE),
+                InlineKeyboardButton(codex_label, callback_data=CB_AGENT_CODEX),
+            ]
+        )
+    else:
+        buttons.append(
+            [
+                InlineKeyboardButton(codex_label, callback_data=CB_AGENT_CODEX),
+                InlineKeyboardButton(claude_label, callback_data=CB_AGENT_CLAUDE),
+            ]
+        )
+    buttons.append([InlineKeyboardButton("Cancel", callback_data=CB_AGENT_CANCEL)])
+    text = (
+        "🤖 *Which agent should run in this topic?*\n\n"
+        "_• = the configured default (override with `CCBOT_DEFAULT_AGENT`)_"
+    )
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def clear_agent_picker_state(user_data: dict | None) -> None:
+    """Clear agent-picker state from user_data."""
+    if user_data is not None:
+        # Don't clear PENDING_AGENT_KEY here — that's downstream state.
+        if user_data.get(STATE_KEY) == STATE_PICKING_AGENT:
+            user_data.pop(STATE_KEY, None)
 
 
 def clear_browse_state(user_data: dict | None) -> None:

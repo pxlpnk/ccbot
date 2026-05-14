@@ -193,6 +193,70 @@ def is_interactive_ui(pane_text: str) -> bool:
     return extract_interactive_content(pane_text) is not None
 
 
+# ── Codex TUI state classifier (T10, read-only) ────────────────────────
+
+# Heuristics. These are intentionally conservative: when uncertain we return
+# ``unknown``, which downstream consumers MUST treat as "do not expose action
+# buttons". Without a captured live Codex TUI snapshot the patterns here are
+# derived from the codex-rs/tui/src/bottom_pane sources and the public docs;
+# revisit when the first real-world Codex tmux snapshot lands in fixtures.
+
+# Approval prompt: bordered bottom-pane block mentioning a proposed command
+# with single-key hints. Pulling on multiple markers reduces false positives.
+_CODEX_APPROVAL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"Allow.*command", re.IGNORECASE),
+    re.compile(r"Approve and run", re.IGNORECASE),
+    re.compile(r"Run this command\?", re.IGNORECASE),
+    re.compile(r"\bAlways allow\b", re.IGNORECASE),
+    # Single-key hint cluster the bottom_pane modal emits — matches "[y/n]",
+    # "y · n · a", and similar variants.
+    re.compile(r"\[?y\s*[·/|,]\s*n", re.IGNORECASE),
+)
+
+_CODEX_BUSY_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*(Thinking|Working|Reasoning|Running|Streaming)\b"),
+    # Animated dots/spinner glyphs Codex uses while a turn is in flight.
+    re.compile(r"^\s*[⠁-⣿]\s+\S"),
+)
+
+_CODEX_INPUT_READY_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # The Codex inline prompt — `▌` or `❯` at the start of an otherwise empty
+    # line. Conservative: must be near the bottom of the pane.
+    re.compile(r"^\s*[▌❯]\s*$"),
+    re.compile(r"^\s*[▌❯]\s+$"),
+)
+
+
+def classify_codex_state(pane_text: str) -> str:
+    """Return one of ``approval`` | ``busy`` | ``input_ready`` | ``unknown``.
+
+    Read-only contract: callers MUST NOT expose Codex approval-action buttons
+    based on this output. Use it for status display, dedup-of-keystroke
+    forwarding, or operator-side logging only. Per the scoping decision for
+    the Codex MVP, structured PreToolUse/PermissionRequest *hooks* are the
+    real path to safe approval handling — pane scraping stays best-effort.
+    """
+    if not pane_text:
+        return "unknown"
+    # Walk bottom-up; the modal/spinner is always at the foot of the pane.
+    lines = pane_text.splitlines()
+    tail = lines[-40:] if len(lines) > 40 else lines
+    joined = "\n".join(tail)
+
+    if any(p.search(joined) for p in _CODEX_APPROVAL_PATTERNS):
+        return "approval"
+    for line in tail:
+        if any(p.match(line) for p in _CODEX_BUSY_PATTERNS):
+            return "busy"
+    for line in reversed(tail):
+        if not line.strip():
+            continue
+        if any(p.match(line) for p in _CODEX_INPUT_READY_PATTERNS):
+            return "input_ready"
+        break
+    return "unknown"
+
+
 # ── Status line parsing ─────────────────────────────────────────────────
 
 # Spinner characters Claude Code uses in its status line
