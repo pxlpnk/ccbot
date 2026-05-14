@@ -15,12 +15,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
 import libtmux
 
 from .config import SENSITIVE_ENV_VARS, config
+
+
+def _shell_quote(value: str) -> str:
+    """Defensive wrapper around shlex.quote that leaves bare tokens alone.
+
+    Argv tokens emitted by an Agent (`claude`, `codex`, `--resume`, UUIDs)
+    rarely need quoting; quoting them unconditionally produces uglier tmux
+    commands. Only escape when the token contains characters that would
+    otherwise break the shell.
+    """
+    if value and all(c.isalnum() or c in "-_./@:=" for c in value):
+        return value
+    return shlex.quote(value)
+
 
 logger = logging.getLogger(__name__)
 
@@ -370,14 +385,22 @@ class TmuxManager:
         window_name: str | None = None,
         start_claude: bool = True,
         resume_session_id: str | None = None,
+        agent: object | None = None,
     ) -> tuple[bool, str, str, str]:
-        """Create a new tmux window and optionally start Claude Code.
+        """Create a new tmux window and optionally start a runtime CLI.
 
         Args:
             work_dir: Working directory for the new window
             window_name: Optional window name (defaults to directory name)
-            start_claude: Whether to start claude command
-            resume_session_id: If set, append --resume <id> to claude command
+            start_claude: Whether to start the runtime command after creating
+                the window. The legacy parameter name is retained for
+                compatibility; both Claude and Codex are launched through
+                ``agent.spawn_argv``.
+            resume_session_id: If set, the runtime is launched in resume mode
+                via ``agent.spawn_argv(resume_thread_id=...)``.
+            agent: Runtime adapter (`Agent` protocol). When ``None`` the
+                module-level default agent is used — this is the historical
+                behavior for Claude-only deployments.
 
         Returns:
             Tuple of (success, message, window_name, window_id)
@@ -414,13 +437,18 @@ class TmuxManager:
                 # Prevent Claude Code from overriding window name
                 window.set_window_option("allow-rename", "off")
 
-                # Start Claude Code if requested
+                # Start the runtime CLI if requested
                 if start_claude:
                     pane = window.active_pane
                     if pane:
-                        cmd = config.claude_command
-                        if resume_session_id:
-                            cmd = f"{cmd} --resume {resume_session_id}"
+                        chosen_agent = agent or config.default_agent
+                        # Build argv via the adapter so Claude / Codex both
+                        # work, then collapse to a shell command (tmux
+                        # send_keys is single-string).
+                        argv = chosen_agent.spawn_argv(  # type: ignore[attr-defined]
+                            resume_thread_id=resume_session_id
+                        )
+                        cmd = " ".join(_shell_quote(a) for a in argv)
                         pane.send_keys(cmd, enter=True)
 
                 logger.info(

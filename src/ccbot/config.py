@@ -63,6 +63,17 @@ class Config:
 
         # Claude command to run in new windows
         self.claude_command = os.getenv("CLAUDE_COMMAND", "claude")
+        # Codex command (overridable for testing or alternative installs)
+        self.codex_command = os.getenv("CODEX_COMMAND", "codex")
+        # Default runtime when the user hasn't explicitly picked one.
+        raw_default = os.getenv("CCBOT_DEFAULT_AGENT", "claude").lower().strip()
+        if raw_default not in ("claude", "codex"):
+            logger.warning(
+                "Unknown CCBOT_DEFAULT_AGENT=%r, falling back to 'claude'",
+                raw_default,
+            )
+            raw_default = "claude"
+        self.default_agent_kind = raw_default
 
         # All state files live under config_dir
         self.state_file = self.config_dir / "state.json"
@@ -82,12 +93,26 @@ class Config:
         else:
             self.claude_projects_path = Path.home() / ".claude" / "projects"
 
-        # Default runtime adapter. Subsequent phases add CodexAgent + a
-        # per-window runtime_kind to choose between them; today every window
-        # is a Claude window.
-        from .agents import ClaudeAgent
+        # Runtime adapter registry. The per-window `runtime_kind` (in
+        # WindowState) selects which adapter routes that window's reads,
+        # writes, and spawn-args. `default_agent` is the one used when no
+        # explicit runtime is recorded for a window — preserved for
+        # backwards-compat with the Claude-only days.
+        from .agents import Agent, ClaudeAgent, CodexAgent
 
-        self.default_agent: ClaudeAgent = ClaudeAgent(self.claude_projects_path)
+        codex_home_env = os.getenv("CODEX_HOME")
+        codex_home = Path(codex_home_env) if codex_home_env else None
+        claude_agent = ClaudeAgent(
+            self.claude_projects_path, default_command=self.claude_command
+        )
+        codex_agent = CodexAgent(
+            codex_home=codex_home, default_command=self.codex_command
+        )
+        self.agents: dict[str, Agent] = {
+            "claude": claude_agent,
+            "codex": codex_agent,
+        }
+        self.default_agent: Agent = self.agents[self.default_agent_kind]
 
         self.monitor_poll_interval = float(os.getenv("MONITOR_POLL_INTERVAL", "2.0"))
 

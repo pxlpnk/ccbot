@@ -52,14 +52,18 @@ class WindowState:
     """Persistent state for a tmux window.
 
     Attributes:
-        session_id: Associated Claude session ID (empty if not yet detected)
+        session_id: Associated thread / session ID (empty if not yet detected)
         cwd: Working directory for direct file path construction
         window_name: Display name of the window
+        runtime_kind: Which runtime adapter owns this window — ``"claude"``
+            (default) or ``"codex"``. Persisted so reads/writes route through
+            the correct on-disk layout after restart.
     """
 
     session_id: str = ""
     cwd: str = ""
     window_name: str = ""
+    runtime_kind: str = "claude"
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -68,6 +72,8 @@ class WindowState:
         }
         if self.window_name:
             d["window_name"] = self.window_name
+        if self.runtime_kind and self.runtime_kind != "claude":
+            d["runtime_kind"] = self.runtime_kind
         return d
 
     @classmethod
@@ -76,6 +82,7 @@ class WindowState:
             session_id=data.get("session_id", ""),
             cwd=data.get("cwd", ""),
             window_name=data.get("window_name", ""),
+            runtime_kind=data.get("runtime_kind", "claude"),
         )
 
 

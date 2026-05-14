@@ -88,15 +88,18 @@ ALLOWED_USERS=your_telegram_user_id
 
 **Optional:**
 
-| Variable                | Default    | Description                                      |
-| ----------------------- | ---------- | ------------------------------------------------ |
-| `CCBOT_DIR`             | `~/.ccbot` | Config/state directory (`.env` loaded from here) |
-| `TMUX_SESSION_NAME`     | `ccbot`    | Tmux session name                                |
-| `CLAUDE_COMMAND`        | `claude`   | Command to run in new windows                    |
-| `MONITOR_POLL_INTERVAL` | `2.0`      | Polling interval in seconds                      |
-| `CCBOT_SHOW_HIDDEN_DIRS` | `false` | Show hidden (dot) directories in directory browser |
-| `OPENAI_API_KEY` | _(none)_ | OpenAI API key for voice message transcription |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI API base URL (for proxies or compatible APIs) |
+| Variable                  | Default                     | Description                                                                                |
+| ------------------------- | --------------------------- | ------------------------------------------------------------------------------------------ |
+| `CCBOT_DIR`               | `~/.ccbot`                  | Config/state directory (`.env` loaded from here)                                           |
+| `TMUX_SESSION_NAME`       | `ccbot`                     | Tmux session name                                                                          |
+| `CLAUDE_COMMAND`          | `claude`                    | Command to run in new windows when the active runtime is Claude                            |
+| `CODEX_COMMAND`           | `codex`                     | Command to run in new windows when the active runtime is Codex                             |
+| `CCBOT_DEFAULT_AGENT`     | `claude`                    | Default runtime adapter — `claude` or `codex`. Selects which CLI new topics launch         |
+| `CODEX_HOME`              | `~/.codex`                  | Codex home directory (overridable for testing; pass-through to the `codex` binary)         |
+| `MONITOR_POLL_INTERVAL`   | `2.0`                       | Polling interval in seconds                                                                |
+| `CCBOT_SHOW_HIDDEN_DIRS`  | `false`                     | Show hidden (dot) directories in directory browser                                         |
+| `OPENAI_API_KEY`          | _(none)_                    | OpenAI API key for voice message transcription                                             |
+| `OPENAI_BASE_URL`         | `https://api.openai.com/v1` | OpenAI API base URL (for proxies or compatible APIs)                                       |
 
 Message formatting is always HTML via `chatgpt-md-converter` (`chatgpt_md_converter` package).
 There is no runtime formatter switch to MarkdownV2.
@@ -109,13 +112,17 @@ There is no runtime formatter switch to MarkdownV2.
 
 ## Hook Setup (Recommended)
 
-Auto-install via CLI:
+Auto-install for **both** runtimes:
 
 ```bash
 ccbot hook --install
 ```
 
-Or manually add to `~/.claude/settings.json`:
+Pass `--agent claude` or `--agent codex` to install only one. The installer is idempotent — re-running on an already-configured settings file is a no-op.
+
+The same `ccbot hook` binary handles payloads from both runtimes; it autodetects which one is calling based on the stdin shape (Claude payloads carry `session_id` + `source`; Codex payloads carry `conversation_id`).
+
+**Claude** (`~/.claude/settings.json`):
 
 ```json
 {
@@ -129,7 +136,34 @@ Or manually add to `~/.claude/settings.json`:
 }
 ```
 
-This writes window-session mappings to `$CCBOT_DIR/session_map.json` (`~/.ccbot/` by default), so the bot automatically tracks which Claude session is running in each tmux window — even after `/clear` or session restarts.
+**Codex** (`~/.codex/config.toml`):
+
+```toml
+[[hooks.session_start]]
+matcher = "*"
+hooks = [{ type = "command", command = "ccbot hook", timeout_sec = 5 }]
+```
+
+Hook events are written to `$CCBOT_DIR/session_map.json` (`~/.ccbot/` by default) with a `runtime_kind` field so the bot routes each window's reads through the correct on-disk layout — even after `/clear` or session restarts.
+
+## Using Codex (OpenAI Codex CLI)
+
+ccbot supports the OpenAI Codex CLI alongside Claude Code via a parallel runtime-adapter architecture. To use Codex:
+
+1. Install `codex` (`codex --version` should report `0.107.0` or newer).
+2. Set `CCBOT_DEFAULT_AGENT=codex` in your `~/.ccbot/.env`.
+3. Install the hook: `ccbot hook --install` (writes both Claude and Codex hooks; safe to re-run).
+4. Optional: set `CODEX_COMMAND=codex --yolo` if you want the unsafe-but-no-approval-prompt mode (analogous to `claude --dangerously-skip-permissions`).
+
+When you create a new Telegram topic, the bot will launch `codex` (or `codex resume <thread_id>` when you pick an existing thread) in a tmux window. The same workflow as Claude — directory browser, optional thread picker, then forwarded messages — applies.
+
+**Known gaps in this release** (see `doc/ontology.md` and follow-up PRs):
+
+- Per-topic agent picker UI (`Which agent? [Claude] [Codex]` inline keyboard) is not yet wired — the default-agent env var is the only switch. Mixed Claude + Codex deployments within one bot instance require choosing the default per-process.
+- Full notification routing through `NormalizedEvent` for Codex (reasoning summaries, function-call output rendering) is implemented in the agent layer but not yet consumed by `SessionMonitor`. Codex spawn + keystroke forwarding + thread resume + history listing all work; live-stream notifications are coming.
+- Approval-action UI (PreToolUse / PermissionRequest) for Codex is read-only in this release. Run Codex with `--yolo` or `--full-auto` for unattended use.
+
+For background on the design — including the entity ontology and why launcher-side registration replaces hook-as-primary in subsequent work — see `doc/ontology.md` and `doc/codex-rollout.md`.
 
 ## Usage
 
