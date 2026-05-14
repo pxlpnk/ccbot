@@ -309,7 +309,13 @@ class TestFormatToolResultText:
         ids=["Read", "Write", "Bash", "Grep", "Glob", "Task", "WebFetch", "empty"],
     )
     def test_format_tool_result_text(self, text: str, tool_name: str, check):
-        result = TranscriptParser._format_tool_result_text(text, tool_name)
+        # Write derives its line count from the tool input (the bytes written),
+        # not from the tool result text. Mirror that here so the parametrized
+        # `text` doubles as the Write input.
+        tool_input_data = {"content": text} if tool_name == "Write" else None
+        result = TranscriptParser._format_tool_result_text(
+            text, tool_name, tool_input_data=tool_input_data
+        )
         assert check(result), f"Failed check for {tool_name!r}: {result!r}"
 
 
