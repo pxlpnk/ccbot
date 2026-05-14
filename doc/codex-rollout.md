@@ -75,8 +75,26 @@ One JSON object per line. Top level:
 
 ### History reconstruction rule
 
-For the `/history` view, **read `response_item` lines only**. `event_msg` lines
-are a parallel live-event stream and would duplicate every assistant message.
+For the `/history` view, read `response_item` lines and apply two filters:
+
+1. **Drop `developer` / `system` role messages.** Codex emits an `<permissions instructions>`
+   block as a `developer`-role `response_item.message` at the top of every session.
+   Surfacing it to Telegram would leak the sandbox configuration.
+2. **Drop `user` messages that are injected context.** Codex prepends one or more
+   `user`-role messages containing wrappers like `<INSTRUCTIONS>...</INSTRUCTIONS>`,
+   `<environment_context>...</environment_context>`, `# AGENTS.md instructions for ...`,
+   or `<user_instructions>...</user_instructions>`. These hold the AGENTS.md content,
+   cwd, timezone, and skill paths — *not* a real user prompt. `CodexAgent.parse_rollout_line`
+   matches on these markers at the start of the message and returns `None`.
+
+`event_msg` lines are a parallel live-event stream and would duplicate every
+assistant message — `parse_rollout_line` skips `event_msg.user_message` and
+`event_msg.agent_message` envelopes too.
+
+For fixture `tests/fixtures/codex/rollouts/01_fresh_then_resumed_alpha_beta.jsonl`:
+line 2 is the developer permissions block (filter 1), line 3 is the AGENTS.md +
+environment_context dump (filter 2), and line 6 is the actual first user prompt
+("Reply with the single word: ALPHA").
 
 ### Tool name in v0.107.0
 

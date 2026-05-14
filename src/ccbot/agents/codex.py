@@ -229,6 +229,12 @@ class CodexAgent:
             role = payload.get("role", "")
             text = _codex_message_text(payload.get("content"))
             if role == "user":
+                # Codex injects AGENTS.md / permissions / environment context
+                # as `user`-role messages before any real prompt. These leak
+                # CWD, timezone, skill paths, and internal instructions if
+                # surfaced to Telegram — skip them.
+                if _is_codex_injected_context(text):
+                    return None
                 return NormalizedEvent(
                     kind=EventKind.USER_MESSAGE,
                     text=text,
@@ -456,6 +462,37 @@ def _parse_codex_timestamp(ts: Any) -> float | None:
         return datetime.fromisoformat(iso).timestamp()
     except (ValueError, OverflowError):
         return None
+
+
+_CODEX_INJECTED_USER_MARKERS = (
+    "<INSTRUCTIONS>",
+    "<environment_context>",
+    "<permissions",  # `<permissions instructions>` and variants
+    "# AGENTS.md",
+    "<user_instructions>",
+)
+
+
+def _is_codex_injected_context(text: str) -> bool:
+    """Heuristic: does this `user`-role message look like Codex's auto-injected context?
+
+    Codex 0.107.0 prepends one or more `user` messages to each session
+    containing wrappers like ``<INSTRUCTIONS>...</INSTRUCTIONS>``,
+    ``<environment_context>...</environment_context>``, ``# AGENTS.md ...``,
+    and ``<permissions instructions>...</permissions instructions>``. These
+    aren't user prompts — they're internal context. Surfacing them to
+    Telegram would leak the user's cwd, timezone, skill paths, and any
+    AGENTS.md content.
+
+    We match on the *start* of the message (after stripping whitespace) so a
+    real user prompt that happens to mention these tags downstream still
+    flows through. Also catch the case where the first non-blank line is one
+    of the markers — Codex sometimes adds a blank line first.
+    """
+    if not text:
+        return False
+    stripped = text.lstrip()
+    return any(stripped.startswith(marker) for marker in _CODEX_INJECTED_USER_MARKERS)
 
 
 def _codex_message_text(content: Any) -> str:

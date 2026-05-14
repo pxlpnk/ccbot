@@ -225,6 +225,99 @@ def test_parse_function_output_strips_codex_header(agent: CodexAgent) -> None:
     assert ev.text == "14 file.txt"
 
 
+def test_parse_filters_developer_role_messages(agent: CodexAgent) -> None:
+    """Codex injects permissions instructions as developer-role messages.
+
+    These must never reach Telegram — they leak sandbox configuration.
+    """
+    line = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "<permissions instructions>\nsandbox_mode = read-only\n</permissions instructions>",
+                    }
+                ],
+            },
+        }
+    )
+    assert agent.parse_rollout_line(line) is None
+
+
+def test_parse_filters_injected_user_context(agent: CodexAgent) -> None:
+    """Codex emits AGENTS.md + environment_context as `user`-role messages.
+
+    These look like real user prompts but contain CWD / timezone / skill paths
+    that would leak to Telegram if surfaced.
+    """
+    cases = [
+        "<INSTRUCTIONS>\nfoo\n</INSTRUCTIONS>",
+        "<environment_context>\n<cwd>/tmp</cwd>\n</environment_context>",
+        "# AGENTS.md instructions for /tmp/proj\n\n<INSTRUCTIONS>...",
+        "<user_instructions>\nstuff\n</user_instructions>",
+        "<permissions instructions>...</permissions instructions>",
+        "  \n<INSTRUCTIONS>leading whitespace</INSTRUCTIONS>",  # leading blank
+    ]
+    for text in cases:
+        line = json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            }
+        )
+        assert agent.parse_rollout_line(line) is None, f"failed to filter: {text!r}"
+
+
+def test_parse_passes_real_user_prompt(agent: CodexAgent) -> None:
+    """A user message mentioning <INSTRUCTIONS> downstream still flows through."""
+    line = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Please update <INSTRUCTIONS> in my prompt template.",
+                    }
+                ],
+            },
+        }
+    )
+    ev = agent.parse_rollout_line(line)
+    assert ev is not None and ev.kind is EventKind.USER_MESSAGE
+
+
+async def test_fixture_first_user_message_is_actual_prompt(agent: CodexAgent) -> None:
+    """Against the real T1 fixture: the first surfaced USER_MESSAGE must be
+    the actual user prompt, not the injected AGENTS.md / environment dump.
+
+    Regression for review comment on PR #1: naively reading all
+    `response_item` lines would expose internal context to Telegram users.
+    """
+    fixture = ROLLOUT_DIR / "01_fresh_then_resumed_alpha_beta.jsonl"
+    first_user: NormalizedEvent | None = None
+    async for ev in agent.iter_rollout_events(fixture):
+        if ev.kind is EventKind.USER_MESSAGE:
+            first_user = ev
+            break
+    assert first_user is not None
+    assert first_user.text == "Reply with the single word: ALPHA"
+    # And nothing in the surfaced text leaks the wrapper markers.
+    assert "<INSTRUCTIONS>" not in first_user.text
+    assert "<environment_context>" not in first_user.text
+    assert "AGENTS.md" not in first_user.text
+
+
 async def test_iter_rollout_events_against_fixture(agent: CodexAgent) -> None:
     """Smoke-test: real rollout file produces a sensible event stream."""
     fixture = ROLLOUT_DIR / "03_tool_use_function_call.jsonl"
