@@ -82,6 +82,13 @@ class Config:
         else:
             self.claude_projects_path = Path.home() / ".claude" / "projects"
 
+        # Default runtime adapter. Subsequent phases add CodexAgent + a
+        # per-window runtime_kind to choose between them; today every window
+        # is a Claude window.
+        from .agents import ClaudeAgent
+
+        self.default_agent: ClaudeAgent = ClaudeAgent(self.claude_projects_path)
+
         self.monitor_poll_interval = float(os.getenv("MONITOR_POLL_INTERVAL", "2.0"))
 
         # Display user messages in history and real-time notifications

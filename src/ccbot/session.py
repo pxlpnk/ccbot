@@ -24,7 +24,6 @@ Key methods for thread binding access:
 import asyncio
 import json
 import logging
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterator
@@ -32,10 +31,18 @@ from typing import Any
 
 import aiofiles
 
+from .agents.base import SessionSummary
 from .config import config
 from .tmux_manager import tmux_manager
 from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json
+
+# Backward-compat alias. Historically the directory-browser handler and other
+# call sites imported `ClaudeSession` from this module. The struct now lives in
+# `agents.base.SessionSummary` because it's runtime-neutral; the old name is
+# preserved so external imports keep working. New code should use
+# `SessionSummary` directly.
+ClaudeSession = SessionSummary
 
 logger = logging.getLogger(__name__)
 
@@ -70,16 +77,6 @@ class WindowState:
             cwd=data.get("cwd", ""),
             window_name=data.get("window_name", ""),
         )
-
-
-@dataclass
-class ClaudeSession:
-    """Information about a Claude Code session."""
-
-    session_id: str
-    summary: str
-    message_count: int
-    file_path: str
 
 
 @dataclass
@@ -575,19 +572,18 @@ class SessionManager:
 
     @staticmethod
     def _encode_cwd(cwd: str) -> str:
-        """Encode a cwd path to match Claude Code's project directory naming.
+        """Encode a cwd path to match the active runtime's directory naming.
 
-        Replaces all non-alphanumeric characters (except dash) with dashes.
-        E.g. /home/user_name/Code/project -> -home-user-name-Code-project
+        Thin pass-through to ``config.default_agent.encode_cwd``; kept as a
+        static method on SessionManager so existing call sites (and any future
+        unit tests) keep working without churn. Future per-window routing will
+        replace this with a per-window agent lookup.
         """
-        return re.sub(r"[^a-zA-Z0-9-]", "-", cwd)
+        return config.default_agent.encode_cwd(cwd)
 
     def _build_session_file_path(self, session_id: str, cwd: str) -> Path | None:
         """Build the direct file path for a session from session_id and cwd."""
-        if not session_id or not cwd:
-            return None
-        encoded_cwd = self._encode_cwd(cwd)
-        return config.claude_projects_path / encoded_cwd / f"{session_id}.jsonl"
+        return config.default_agent.build_session_file_path(session_id, cwd)
 
     async def _get_session_direct(
         self, session_id: str, cwd: str
@@ -646,38 +642,13 @@ class SessionManager:
     # --- Directory session listing ---
 
     async def list_sessions_for_directory(self, cwd: str) -> list[ClaudeSession]:
-        """List existing Claude sessions for a directory.
+        """List existing sessions for a directory via the active runtime adapter.
 
-        Encodes the cwd path to find the project directory under
-        ~/.claude/projects/{encoded_cwd}/, globs *.jsonl files, and
-        extracts summary info from each.
-
-        Returns a list sorted by mtime (most recent first), capped at 10.
+        Delegates to ``config.default_agent.list_sessions_for_directory``;
+        ordering, filtering, and cap are the adapter's responsibility. Returns
+        an empty list when no sessions exist.
         """
-        encoded_cwd = self._encode_cwd(cwd)
-        project_dir = config.claude_projects_path / encoded_cwd
-        if not project_dir.is_dir():
-            return []
-
-        # Collect JSONL files sorted by mtime (newest first)
-        jsonl_files = sorted(
-            project_dir.glob("*.jsonl"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-
-        # Skip sessions-index and cap at 10
-        sessions: list[ClaudeSession] = []
-        for f in jsonl_files:
-            if f.stem == "sessions-index":
-                continue
-            if len(sessions) >= 10:
-                break
-            session_id = f.stem
-            session = await self._get_session_direct(session_id, cwd)
-            if session and session.message_count > 0:
-                sessions.append(session)
-        return sessions
+        return await config.default_agent.list_sessions_for_directory(cwd)
 
     # --- Window → Session resolution ---
 
