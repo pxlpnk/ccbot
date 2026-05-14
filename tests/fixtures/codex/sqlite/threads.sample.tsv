@@ -1,0 +1,4 @@
+id	source	cwd	created_at	updated_at	archived	rollout_basename
+019e23f7-c20f-7390-8659-aa100c53092a	exec	/tmp/codex-fixture-work/workdir1	1778719900	1778719929	0	ut-2026-05-14T07-51-40-019e23f7-c20f-7390-8659-aa100c53092a.jsonl
+019e23f7-ece6-7583-95a7-4563f451a187	exec	/tmp/codex-fixture-work/workdir1	1778719911	1778719913	0	ut-2026-05-14T07-51-51-019e23f7-ece6-7583-95a7-4563f451a187.jsonl
+019e23f7-f520-7580-92d7-9d6bfcdcea22	exec	/tmp/codex-fixture-work/workdir1	1778719913	1778719919	0	ut-2026-05-14T07-51-53-019e23f7-f520-7580-92d7-9d6bfcdcea22.jsonl
