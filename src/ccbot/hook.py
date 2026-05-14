@@ -132,7 +132,14 @@ def _install_hook() -> int:
 
 
 def hook_main() -> None:
-    """Process a Claude Code hook event from stdin, or install the hook."""
+    """Process a Claude or Codex hook event from stdin, or install the hook.
+
+    ``--install`` installs into the chosen runtime's settings file
+    (``--agent claude`` writes JSON to ``~/.claude/settings.json``;
+    ``--agent codex`` writes TOML to ``~/.codex/config.toml``). When no
+    ``--agent`` flag is given, ``--install`` installs for both runtimes that
+    look usable; hook payloads are routed by autodetect on the stdin shape.
+    """
     # Configure logging for the hook subprocess (main.py logging doesn't apply here)
     logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -142,19 +149,24 @@ def hook_main() -> None:
 
     parser = argparse.ArgumentParser(
         prog="ccbot hook",
-        description="Claude Code session tracking hook",
+        description="Session tracking hook for Claude Code / Codex",
     )
     parser.add_argument(
         "--install",
         action="store_true",
-        help="Install the hook into ~/.claude/settings.json",
+        help="Install the hook into the runtime settings file(s)",
     )
-    # Parse only known args to avoid conflicts with stdin JSON
+    parser.add_argument(
+        "--agent",
+        choices=("claude", "codex"),
+        default=None,
+        help="Force which runtime's settings to install / which payload to assume",
+    )
     args, _ = parser.parse_known_args(sys.argv[2:])
 
     if args.install:
-        logger.info("Hook install requested")
-        sys.exit(_install_hook())
+        logger.info("Hook install requested (agent=%s)", args.agent or "auto")
+        sys.exit(_install_hooks(agent=args.agent))
 
     # Normal hook processing: read JSON from stdin
     logger.debug("Processing hook event from stdin")
@@ -164,6 +176,23 @@ def hook_main() -> None:
         logger.warning("Failed to parse stdin JSON: %s", e)
         return
 
+    if not isinstance(payload, dict):
+        logger.warning("Hook payload is not a JSON object, ignoring")
+        return
+
+    agent_kind = args.agent or _detect_agent_kind(payload)
+    if agent_kind is None:
+        logger.warning(
+            "Could not classify hook payload as claude or codex; ignoring (keys=%s)",
+            list(payload.keys()),
+        )
+        return
+
+    if agent_kind == "codex":
+        _handle_codex_hook(payload)
+        return
+
+    # Claude path (existing behavior, kept verbatim)
     session_id = payload.get("session_id", "")
     cwd = payload.get("cwd", "")
     event = payload.get("hook_event_name", "")
@@ -274,3 +303,134 @@ def hook_main() -> None:
                 fcntl.flock(lock_f, fcntl.LOCK_UN)
     except OSError as e:
         logger.error("Failed to write session_map: %s", e)
+
+
+# ---------- Multi-agent helpers ---------------------------------------------
+
+
+def _detect_agent_kind(payload: dict) -> str | None:
+    """Classify a hook payload as 'claude' or 'codex'.
+
+    Returns None when neither adapter recognises the shape.
+    """
+    from .agents import ClaudeAgent, CodexAgent
+
+    # Codex first — its `conversation_id` field is more discriminating than
+    # Claude's generic `session_id` + `hook_event_name`.
+    if CodexAgent.detect_hook_payload(payload):
+        return "codex"
+    if ClaudeAgent.detect_hook_payload(payload):
+        return "claude"
+    return None
+
+
+def _install_hooks(*, agent: str | None) -> int:
+    """Install hooks for one or both runtimes. Returns 0 on success, 1 on error.
+
+    Each runtime's installer is idempotent — already-installed entries report
+    success without re-writing the file.
+    """
+    from .agents import ClaudeAgent, CodexAgent
+
+    targets: list[object] = []
+    if agent in (None, "claude"):
+        targets.append(ClaudeAgent(projects_path=Path.home() / ".claude" / "projects"))
+    if agent in (None, "codex"):
+        targets.append(CodexAgent())
+
+    errors: list[str] = []
+    for adapter in targets:
+        # Both adapters expose .install_hook() via the Agent protocol.
+        result = adapter.install_hook()  # type: ignore[attr-defined]
+        logger.info("%s: %s", adapter.__class__.__name__, result.message)
+        print(result.message)
+        if not result.installed and "Error" in result.message:
+            errors.append(result.message)
+    return 1 if errors else 0
+
+
+def _handle_codex_hook(payload: dict) -> None:
+    """Mirror Claude's session_map write for a Codex hook payload.
+
+    Codex's SessionStart fires per spawned process. We record the binding under
+    the same ``<tmux_session>:<window_id>`` key as Claude so the existing
+    session-map readers continue to work — distinguishing runtime kind is the
+    job of the per-window state added in T4.
+    """
+    event = payload.get("hook_event_name", "")
+    # Codex's catalog uses ``thread_id`` / ``conversation_id`` interchangeably
+    # across hook event variants.
+    thread_id = (
+        payload.get("conversation_id")
+        or payload.get("thread_id")
+        or payload.get("session_id")
+        or ""
+    )
+    cwd = payload.get("cwd", "")
+    if event != "SessionStart":
+        logger.debug("Ignoring non-SessionStart codex event: %s", event)
+        return
+    if not isinstance(thread_id, str) or not _UUID_RE.match(thread_id):
+        logger.warning("Codex hook: invalid thread_id: %r", thread_id)
+        return
+    if cwd and not os.path.isabs(cwd):
+        logger.warning("Codex hook: cwd not absolute: %r", cwd)
+        return
+
+    pane_id = os.environ.get("TMUX_PANE", "")
+    if not pane_id:
+        logger.warning("TMUX_PANE not set; cannot bind codex thread to window")
+        return
+    result = subprocess.run(
+        [
+            "tmux",
+            "display-message",
+            "-t",
+            pane_id,
+            "-p",
+            "#{session_name}:#{window_id}:#{window_name}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    parts = result.stdout.strip().split(":", 2)
+    if len(parts) < 3:
+        logger.warning("Codex hook: failed to read tmux key (pane=%s)", pane_id)
+        return
+    tmux_session_name, window_id, window_name = parts
+    session_window_key = f"{tmux_session_name}:{window_id}"
+
+    from .utils import atomic_write_json, ccbot_dir
+
+    map_file = ccbot_dir() / "session_map.json"
+    map_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = map_file.with_suffix(".lock")
+    try:
+        with open(lock_path, "w") as lock_f:
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
+            try:
+                session_map: dict[str, dict[str, str]] = {}
+                if map_file.exists():
+                    try:
+                        session_map = json.loads(map_file.read_text())
+                    except (json.JSONDecodeError, OSError):
+                        logger.warning(
+                            "Failed to read existing session_map, starting fresh"
+                        )
+                session_map[session_window_key] = {
+                    "session_id": thread_id,
+                    "cwd": cwd,
+                    "window_name": window_name,
+                    "runtime_kind": "codex",
+                }
+                atomic_write_json(map_file, session_map)
+                logger.info(
+                    "Updated session_map (codex): %s -> thread_id=%s, cwd=%s",
+                    session_window_key,
+                    thread_id,
+                    cwd,
+                )
+            finally:
+                fcntl.flock(lock_f, fcntl.LOCK_UN)
+    except OSError as e:
+        logger.error("Failed to write session_map (codex): %s", e)

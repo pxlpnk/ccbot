@@ -11,7 +11,22 @@ window, live process, thread, rollout) and the non-collapsing invariants
 every adapter must respect.
 """
 
-from .base import Agent, SessionSummary
+from .base import (
+    Agent,
+    EventKind,
+    HookInstallResult,
+    NormalizedEvent,
+    SessionSummary,
+)
 from .claude import ClaudeAgent
+from .codex import CodexAgent
 
-__all__ = ["Agent", "ClaudeAgent", "SessionSummary"]
+__all__ = [
+    "Agent",
+    "ClaudeAgent",
+    "CodexAgent",
+    "EventKind",
+    "HookInstallResult",
+    "NormalizedEvent",
+    "SessionSummary",
+]
