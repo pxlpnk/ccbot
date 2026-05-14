@@ -20,6 +20,7 @@ from typing import Any, Callable, Awaitable
 
 import aiofiles
 
+from .agents.base import EventKind, NormalizedEvent
 from .config import config
 from .monitor_state import MonitorState, TrackedSession
 from .tmux_manager import tmux_manager
@@ -49,6 +50,75 @@ class NewMessage:
     role: str = "assistant"  # "user" or "assistant"
     tool_name: str | None = None  # For tool_use messages, the tool name
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
+
+
+def _codex_event_to_new_message(
+    thread_id: str, event: NormalizedEvent
+) -> "NewMessage | None":
+    """Convert a Codex `NormalizedEvent` into the existing `NewMessage` shape.
+
+    Lifecycle / SUMMARY events are dropped (no Telegram-facing payload).
+    THINKING is mapped to ``content_type == "thinking"`` so the formatter
+    renders it the same way Claude reasoning is rendered.
+    """
+    if event.kind in (EventKind.LIFECYCLE, EventKind.SUMMARY):
+        return None
+    if not event.text and event.kind not in (
+        EventKind.TOOL_CALL,
+        EventKind.TOOL_RESULT,
+    ):
+        return None
+
+    if event.kind is EventKind.USER_MESSAGE:
+        if not config.show_user_messages:
+            return None
+        return NewMessage(
+            session_id=thread_id,
+            text=event.text,
+            is_complete=True,
+            content_type="text",
+            role="user",
+        )
+    if event.kind is EventKind.ASSISTANT_MESSAGE:
+        return NewMessage(
+            session_id=thread_id,
+            text=event.text,
+            is_complete=True,
+            content_type="text",
+            role="assistant",
+        )
+    if event.kind is EventKind.THINKING:
+        return NewMessage(
+            session_id=thread_id,
+            text=event.text,
+            is_complete=True,
+            content_type="thinking",
+            role="assistant",
+        )
+    if event.kind is EventKind.TOOL_CALL:
+        if not config.show_tool_calls:
+            return None
+        return NewMessage(
+            session_id=thread_id,
+            text=event.text,
+            is_complete=True,
+            content_type="tool_use",
+            role="assistant",
+            tool_use_id=event.tool_call_id,
+            tool_name=event.tool_name,
+        )
+    if event.kind is EventKind.TOOL_RESULT:
+        if not config.show_tool_calls:
+            return None
+        return NewMessage(
+            session_id=thread_id,
+            text=event.text,
+            is_complete=True,
+            content_type="tool_result",
+            role="user",
+            tool_use_id=event.tool_call_id,
+        )
+    return None
 
 
 class SessionMonitor:
@@ -372,6 +442,171 @@ class SessionMonitor:
         self.state.save_if_dirty()
         return new_messages
 
+    async def check_codex_updates(self) -> list[NewMessage]:
+        """Sibling of `check_for_updates` for windows running Codex.
+
+        Reads the session_map.json entries flagged ``runtime_kind == "codex"``,
+        resolves each rollout via ``CodexAgent.build_session_file_path``, and
+        emits ``NewMessage`` items by converting the agent's
+        ``NormalizedEvent`` stream.
+
+        Byte-offset tracking reuses ``self.state`` keyed by Codex thread id,
+        so resume sessions (same id, appended rollout) just advance their
+        offset like Claude does.
+        """
+        new_messages: list[NewMessage] = []
+        codex_entries = await self._load_codex_entries()
+        if not codex_entries:
+            return new_messages
+
+        agent = config.agents.get("codex")
+        if agent is None:
+            return new_messages
+
+        for window_key, info in codex_entries.items():
+            thread_id = info.get("session_id", "")
+            cwd = info.get("cwd", "")
+            if not thread_id:
+                continue
+            file_path = agent.build_session_file_path(thread_id, cwd)
+            if file_path is None or not file_path.exists():
+                continue
+
+            try:
+                st = file_path.stat()
+                current_mtime = st.st_mtime
+                current_size = st.st_size
+            except OSError:
+                continue
+
+            tracked = self.state.get_session(thread_id)
+            if tracked is None:
+                # Start tracking at end-of-file so we don't replay history on
+                # first sight — matches the Claude path semantics.
+                tracked = TrackedSession(
+                    session_id=thread_id,
+                    file_path=str(file_path),
+                    last_byte_offset=current_size,
+                )
+                self.state.update_session(tracked)
+                self._file_mtimes[thread_id] = current_mtime
+                logger.info(
+                    "Started tracking codex thread %s in window %s",
+                    thread_id,
+                    window_key,
+                )
+                continue
+
+            last_mtime = self._file_mtimes.get(thread_id, 0.0)
+            if current_mtime <= last_mtime and current_size <= tracked.last_byte_offset:
+                continue
+
+            events = await self._read_new_codex_events(tracked, file_path)
+            self._file_mtimes[thread_id] = current_mtime
+            for ev in events:
+                msg = _codex_event_to_new_message(thread_id, ev)
+                if msg is not None:
+                    new_messages.append(msg)
+            self.state.update_session(tracked)
+
+        self.state.save_if_dirty()
+        return new_messages
+
+    async def _read_new_codex_events(
+        self, session: TrackedSession, file_path: Path
+    ) -> list[NormalizedEvent]:
+        """Incremental read of a Codex rollout into NormalizedEvent.
+
+        Mirrors `_read_new_lines` for Codex: handles truncation reset,
+        partial JSONL writes, and corrupted mid-line offsets. Stops at the
+        first partial line so the next poll picks it up cleanly.
+        """
+        events: list[NormalizedEvent] = []
+        agent = config.agents.get("codex")
+        if agent is None:
+            return events
+        try:
+            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+                await f.seek(0, 2)
+                file_size = await f.tell()
+                if session.last_byte_offset > file_size:
+                    logger.info(
+                        "Codex rollout truncated for %s (offset %d > size %d). "
+                        "Resetting.",
+                        session.session_id,
+                        session.last_byte_offset,
+                        file_size,
+                    )
+                    session.last_byte_offset = 0
+
+                await f.seek(session.last_byte_offset)
+
+                if session.last_byte_offset > 0:
+                    first_char = await f.read(1)
+                    if first_char and first_char != "{":
+                        logger.warning(
+                            "Corrupted codex offset %d for %s (mid-line), "
+                            "scanning to next line",
+                            session.last_byte_offset,
+                            session.session_id,
+                        )
+                        await f.readline()
+                        session.last_byte_offset = await f.tell()
+                        return events
+                    await f.seek(session.last_byte_offset)
+
+                safe_offset = session.last_byte_offset
+                async for line in f:
+                    stripped = line.strip()
+                    if not stripped:
+                        safe_offset = await f.tell()
+                        continue
+                    try:
+                        json.loads(stripped)
+                    except json.JSONDecodeError:
+                        # Partial write — try again next cycle, don't advance.
+                        logger.warning(
+                            "Partial codex JSONL line in %s, will retry",
+                            session.session_id,
+                        )
+                        break
+                    ev = agent.parse_rollout_line(stripped)
+                    if ev is not None:
+                        events.append(ev)
+                    safe_offset = await f.tell()
+                session.last_byte_offset = safe_offset
+        except OSError as e:
+            logger.error("Error reading codex rollout %s: %s", file_path, e)
+        return events
+
+    async def _load_codex_entries(self) -> dict[str, dict[str, str]]:
+        """Return session_map entries whose runtime_kind == 'codex'.
+
+        Keyed by the same ``tmux_session:window_id`` shape the file uses
+        (without the leading ``<tmux_session>:`` prefix the rest of the
+        monitor strips). Empty when the map is missing or unreadable.
+        """
+        result: dict[str, dict[str, str]] = {}
+        if not config.session_map_file.exists():
+            return result
+        try:
+            async with aiofiles.open(config.session_map_file, "r") as f:
+                content = await f.read()
+            session_map = json.loads(content)
+        except (json.JSONDecodeError, OSError):
+            return result
+        prefix = f"{config.tmux_session_name}:"
+        for key, info in session_map.items():
+            if not isinstance(info, dict):
+                continue
+            if not key.startswith(prefix):
+                continue
+            if info.get("runtime_kind") != "codex":
+                continue
+            window_key = key[len(prefix) :]
+            result[window_key] = info
+        return result
+
     async def _load_current_session_map(self) -> dict[str, str]:
         """Load current session_map and return window_key -> session_id mapping.
 
@@ -490,8 +725,11 @@ class SessionMonitor:
                 current_map = await self._detect_and_cleanup_changes()
                 active_session_ids = set(current_map.values())
 
-                # Check for new messages (all I/O is async)
+                # Check for new messages (all I/O is async).
+                # Claude path: existing JSONL scan over claude_projects_path.
+                # Codex path: per-window rollouts resolved via the agent.
                 new_messages = await self.check_for_updates(active_session_ids)
+                new_messages.extend(await self.check_codex_updates())
 
                 for msg in new_messages:
                     status = "complete" if msg.is_complete else "streaming"
